@@ -19,14 +19,12 @@ async def login(p):
     browser = await p.chromium.launch(headless=False)
     context = await browser.new_context()
     page = await context.new_page()
-
     await page.goto("https://www.reddit.com/login")
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, input, "Press ENTER here when you have finished logging in...")
 
     try:
-        # Save the storage state
         await context.storage_state(path=SESSION_FILE)
         print(f"Session saved to {SESSION_FILE}")
     except Exception as e:
@@ -35,69 +33,62 @@ async def login(p):
         await browser.close()
 
 async def get_subscribed_subreddits(page):
-    """Extracts the list of subreddits by exploring multiple Reddit pages."""
+    """Extracts the list of subreddits using the multireddit link method."""
     print("Fetching subscribed subreddits...")
     subreddits = set()
 
-    # Target URLs that list subreddits
-    urls = [
-        "https://old.reddit.com/subreddits/mine/",
-        "https://www.reddit.com/subreddits/mine/",
-        "https://www.reddit.com/best/communities/1/", # Another source of community lists
+    # Method 1: Search for the 'multireddit' link on the subreddits page
+    # This link usually looks like /r/sub1+sub2+sub3...
+    urls_to_check = [
+        "https://old.reddit.com/subreddits/",
+        "https://www.reddit.com/subreddits/",
     ]
 
-    for url in urls:
-        print(f"Scanning {url}...")
+    for url in urls_to_check:
+        print(f"Scanning {url} for multireddit link...")
         try:
             await page.goto(url, wait_until="domcontentloaded")
             await asyncio.sleep(3)
 
-            # Extract links containing /r/
-            # This is a broad search to ensure we catch everything
-            elements = await page.query_selector_all("a")
-            for el in elements:
-                href = await el.get_attribute("href")
-                if href and "/r/" in href:
-                    # Clean the name
-                    match = re.search(r'/r/([a-zA-Z0-9_]+)', href)
+            # Find all links and look for the one containing many '+' symbols
+            links = await page.query_selector_all("a")
+            for link in links:
+                href = await link.get_attribute("href")
+                if href and "+" in href and "/r/" in href:
+                    # Potential multireddit link
+                    match = re.search(r'/r/([a-zA-Z0-9_+]+)', href)
                     if match:
-                        name = match.group(1).lower()
-                        if name not in ["all", "popular", "friends", "dashboard", "help", "redditdev", "mod", "home"]:
-                            subreddits.add(name)
+                        subs = match.group(1).split("+")
+                        if len(subs) > 5: # Only if it's a real list
+                            print(f"Found multireddit link with {len(subs)} subreddits!")
+                            for s in subs:
+                                if s: subreddits.add(s.lower())
 
-            # Handle pagination if on old reddit
-            if "old.reddit" in url:
-                for _ in range(10): # Max 10 pages for safety
-                    next_button = await page.query_selector(".next-button a")
-                    if next_button:
-                        await next_button.click()
-                        await asyncio.sleep(2)
-                        elements = await page.query_selector_all("a.title")
-                        for el in elements:
-                            href = await el.get_attribute("href")
-                            match = re.search(r'/r/([a-zA-Z0-9_]+)', href)
-                            if match: subreddits.add(match.group(1).lower())
-                    else:
-                        break
+            if subreddits: break # Stop if we found them
         except Exception as e:
-            print(f"Skipping {url} due to error: {e}")
+            print(f"Error on {url}: {e}")
 
-    # Fallback to the sidebar navigation in new reddit if still empty
+    # Method 2: Fallback to scanning for any /r/ links (existing logic)
     if not subreddits:
-        print("Still nothing... checking sidebar navigation.")
-        await page.goto("https://www.reddit.com/", wait_until="networkidle")
-        # Try to open the community drawer
-        drawer_button = await page.query_selector("#left-nav-drawer-button, [aria-label='Communities']")
-        if drawer_button:
-            await drawer_button.click()
-            await asyncio.sleep(2)
-            elements = await page.query_selector_all("a[href*='/r/']")
-            for el in elements:
-                href = await el.get_attribute("href")
-                match = re.search(r'/r/([a-zA-Z0-9_]+)', href)
-                if match: subreddits.add(match.group(1).lower())
+        print("No multireddit link found, falling back to manual scanning...")
+        # Check 'mine' pages
+        mine_urls = ["https://old.reddit.com/subreddits/mine/", "https://www.reddit.com/subreddits/mine/"]
+        for url in mine_urls:
+            try:
+                await page.goto(url, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                links = await page.query_selector_all("a")
+                for link in links:
+                    href = await link.get_attribute("href")
+                    if href:
+                        m = re.search(r'/r/([a-zA-Z0-9_]+)', href)
+                        if m:
+                            name = m.group(1).lower()
+                            if name not in ["all", "popular", "friends", "mod", "home"]:
+                                subreddits.add(name)
+            except: pass
 
-    print(f"Found {len(subreddits)} unique subreddits.")
+    print(f"Total unique subreddits found: {len(subreddits)}")
     return list(subreddits)
 
 async def scrape_subreddit_metrics(page, sub_name):
@@ -113,11 +104,11 @@ async def scrape_subreddit_metrics(page, sub_name):
 
     try:
         await page.goto(url, wait_until="domcontentloaded")
-        await asyncio.sleep(2)
+        await asyncio.sleep(1.5) # Fast but enough for basic shreddit load
 
         content = await page.content()
 
-        # Robust regex for activity metrics
+        # Regex for activity metrics
         v_match = re.search(r'([\d.kKM,]+)\s+Weekly\s+visitors', content, re.IGNORECASE)
         c_match = re.search(r'([\d.kKM,]+)\s+Weekly\s+contributions', content, re.IGNORECASE)
 
@@ -151,11 +142,10 @@ async def unsubscribe(page, sub_name):
     try:
         await page.goto(f"https://www.reddit.com/r/{sub_name}/")
         await asyncio.sleep(2)
-        # Try finding the Joined button
         button = await page.query_selector("button:has-text('Joined'), [aria-label*='Leave'], button:has-text('Leave')")
         if button:
             await button.click()
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
             confirm = await page.query_selector("button:has-text('Leave')")
             if confirm: await confirm.click()
             print("Success.")
@@ -169,7 +159,7 @@ async def run_manager():
         while True:
             print("\n--- Reddit Subreddit Manager ---")
             print("1. Login (Headed)")
-            print("2. Fetch & Analyze")
+            print("2. Fetch & Analyze (Long process!)")
             print("3. Filter & Unsubscribe (from CSV)")
             print("4. Exit")
 
@@ -186,7 +176,7 @@ async def run_manager():
                 context = await browser.new_context(storage_state=SESSION_FILE)
                 page = await context.new_page()
 
-                # Check if we are really logged in
+                # Verify session
                 await page.goto("https://www.reddit.com/settings/")
                 if "login" in page.url.lower():
                     print("Error: The saved session is invalid or expired. Please login again.")
@@ -195,23 +185,22 @@ async def run_manager():
 
                 subs = await get_subscribed_subreddits(page)
                 if not subs:
-                    print("Error: No subreddits found. Ensure you are logged in and have subscriptions.")
+                    print("No subreddits found.")
                     await browser.close()
                     continue
 
                 results = []
+                total = len(subs)
                 for i, name in enumerate(subs):
-                    print(f"[{i+1}/{len(subs)}] r/{name}...")
+                    print(f"[{i+1}/{total}] r/{name}...", end="\r")
                     data = await scrape_subreddit_metrics(page, name)
                     results.append(data)
-                    await asyncio.sleep(1)
+                    # No delay for large lists, Playwright handles speed well
 
                 if results:
                     df = pd.DataFrame(results)
                     df.sort_values('weekly_contributions', ascending=False).to_csv(OUTPUT_CSV, index=False)
-                    print(f"\nSaved to {OUTPUT_CSV}")
-                else:
-                    print("No data collected.")
+                    print(f"\nSaved {len(results)} records to {OUTPUT_CSV}")
 
                 await browser.close()
 
@@ -222,9 +211,9 @@ async def run_manager():
                 df = pd.read_csv(OUTPUT_CSV)
                 m = input("Filter by (1: visitors, 2: contributions): ")
                 k = 'weekly_visitors' if m == '1' else 'weekly_contributions'
-                val = float(input(f"Cutoff: "))
+                val = float(input(f"Cutoff (remove items < this): "))
                 to_rem = df[df[k] < val]['name'].tolist()
-                if to_rem and input(f"Unsubscribe from {len(to_rem)}? (y/n): ") == 'y':
+                if to_rem and input(f"Unsubscribe from {len(to_rem)} subreddits? (y/n): ") == 'y':
                     browser = await p.chromium.launch(headless=False)
                     context = await browser.new_context(storage_state=SESSION_FILE)
                     page = await context.new_page()
