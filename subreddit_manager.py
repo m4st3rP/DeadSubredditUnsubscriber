@@ -1,227 +1,223 @@
+import asyncio
+import pandas as pd
+import re
 import os
 import sys
-import csv
-import praw
-import time
-import argparse
-import logging
-import requests
-from bs4 import BeautifulSoup
-from datetime import datetime
-from dotenv import load_dotenv
+from playwright.async_api import async_playwright
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
+# File to store the browser session to avoid repeated logins
+SESSION_FILE = "reddit_session.json"
+OUTPUT_CSV = "subreddits_stats.csv"
 
-# Load environment variables
-load_dotenv()
+async def login(p):
+    """Launch a headed browser for manual login and save session."""
+    print("\n--- LOGIN MODE ---")
+    print("A browser window will open. Please log in to your Reddit account.")
+    print("Once you are logged in and see your home feed, the script will detect it.")
 
-def get_reddit_instance():
-    """Initializes and returns a PRAW Reddit instance."""
-    client_id = os.getenv("REDDIT_CLIENT_ID")
-    client_secret = os.getenv("REDDIT_CLIENT_SECRET")
-    username = os.getenv("REDDIT_USERNAME")
-    password = os.getenv("REDDIT_PASSWORD")
-    user_agent = os.getenv("REDDIT_USER_AGENT", "DeadSubredditUnsubscriber/0.1")
+    browser = await p.chromium.launch(headless=False)
+    context = await browser.new_context()
+    page = await context.new_page()
 
-    if not all([client_id, client_secret, username, password]):
-        logger.error("Missing Reddit API credentials in .env file.")
-        logger.info("Please ensure REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, and REDDIT_PASSWORD are set.")
-        sys.exit(1)
+    await page.goto("https://www.reddit.com/login")
 
-    return praw.Reddit(
-        client_id=client_id,
-        client_secret=client_secret,
-        username=username,
-        password=password,
-        user_agent=user_agent
-    )
+    try:
+        # Wait until we see evidence of being logged in (the user drawer/avatar)
+        # We use a long timeout (5 minutes) to give the user plenty of time.
+        await page.wait_for_selector("#email-collection-tooltip-id, #web-navigation-user-menu, faceplate-tracker[noun='user_menu']", timeout=300000)
+        print("Login detected!")
+        # Save the storage state
+        await context.storage_state(path=SESSION_FILE)
+        print(f"Session saved to {SESSION_FILE}")
+    except Exception as e:
+        print(f"Login timeout or failed: {e}")
+    finally:
+        await browser.close()
 
-def fetch_weekly_metrics(subreddit_name):
-    """
-    Attempts to fetch weekly visitors and contributions by scraping the subreddit's about page.
-    Note: This is a fallback as these metrics are not currently in the official PRAW/Reddit API.
-    """
-    url = f"https://www.reddit.com/r/{subreddit_name}/"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+async def get_subscribed_subreddits(page):
+    """Extracts the list of subreddits by scrolling through the 'mine' page."""
+    print("Fetching subscribed subreddits...")
+    await page.goto("https://www.reddit.com/subreddits/mine/")
+
+    subreddits = set()
+
+    # Scroll to load all subreddits (Reddit uses infinite scroll or pagination here)
+    last_height = await page.evaluate("document.body.scrollHeight")
+    while True:
+        # Extract currently visible subreddits
+        elements = await page.query_selector_all("a.title, a.subreddit, .subscription-box a")
+        for el in elements:
+            href = await el.get_attribute("href")
+            if href and "/r/" in href:
+                # Handle cases like /r/python/ or /r/python
+                parts = href.split("/r/")
+                if len(parts) > 1:
+                    name = parts[1].split("/")[0].strip()
+                    if name and name not in ["all", "popular"]:
+                        subreddits.add(name.lower())
+
+        # Scroll down
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(2) # Wait for load
+
+        new_height = await page.evaluate("document.body.scrollHeight")
+        if new_height == last_height:
+            # Try one more wait in case it's slow
+            await asyncio.sleep(3)
+            new_height = await page.evaluate("document.body.scrollHeight")
+            if new_height == last_height:
+                break
+        last_height = new_height
+
+    print(f"Found {len(subreddits)} unique subreddits.")
+    return list(subreddits)
+
+async def scrape_subreddit_metrics(page, sub_name):
+    """Navigates to a subreddit and extracts metrics from the sidebar/content."""
+    url = f"https://www.reddit.com/r/{sub_name}/"
+    metrics = {
+        'name': sub_name,
+        'weekly_visitors': 0,
+        'weekly_contributions': 0,
+        'subscribers': 0,
+        'created_date': 'Unknown'
     }
 
-    visitors = 0
-    contributions = 0
-
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            # These metrics are often inside a shreddit-app or specific custom elements
-            # Look for patterns like "21K Weekly visitors" or "137 Weekly contributions"
-            text = soup.get_text()
+        await page.goto(url, wait_until="domcontentloaded")
+        await asyncio.sleep(2) # Allow for hydration
 
-            # Simple regex search in the text
-            import re
-            v_match = re.search(r'([0-9kK.M]+)\s+Weekly visitors', text)
-            c_match = re.search(r'([0-9kK.M]+)\s+Weekly contributions', text)
+        content = await page.content()
 
-            def parse_metric(m):
-                if not m: return 0
-                val = m.group(1).lower()
-                if 'k' in val:
-                    return int(float(val.replace('k', '')) * 1000)
-                if 'm' in val:
-                    return int(float(val.replace('m', '')) * 1000000)
-                return int(float(val))
+        # 1. Weekly Visitors & Contributions (Regex on raw HTML content)
+        v_match = re.search(r'([0-9kK.M]+)\s+Weekly visitors', content)
+        c_match = re.search(r'([0-9kK.M]+)\s+Weekly contributions', content)
 
-            visitors = parse_metric(v_match)
-            contributions = parse_metric(c_match)
+        def parse_val(m):
+            if not m: return 0
+            val = m.group(1).lower().replace(',', '')
+            if 'k' in val: return int(float(val.replace('k', '')) * 1000)
+            if 'm' in val: return int(float(val.replace('m', '')) * 1000000)
+            return int(float(val))
+
+        metrics['weekly_visitors'] = parse_val(v_match)
+        metrics['weekly_contributions'] = parse_val(c_match)
+
+        # 2. Subscribers
+        sub_match = re.search(r'([0-9kK.M,]+)\s+Members', content) or re.search(r'([0-9kK.M,]+)\s+subscribers', content)
+        if sub_match:
+            metrics['subscribers'] = parse_val(sub_match)
+
+        # 3. Created Date (proxy for subscription date)
+        # Look for "Created ..." in the sidebar
+        date_match = re.search(r'Created\s+([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})', content)
+        if date_match:
+            metrics['created_date'] = date_match.group(1)
+
     except Exception as e:
-        logger.debug(f"Could not fetch weekly metrics for r/{subreddit_name}: {e}")
+        print(f"Error scraping r/{sub_name}: {e}")
 
-    return visitors, contributions
+    return metrics
 
-def collect_subreddits(reddit):
-    """Collects data for all subscribed subreddits."""
-    logger.info("Fetching subscribed subreddits... this may take a moment.")
-    subreddits_data = []
-
+async def unsubscribe(page, sub_name):
+    """Unsubscribes from a subreddit."""
+    print(f"Attempting to unsubscribe from r/{sub_name}...")
     try:
-        subscriptions = list(reddit.user.subreddits(limit=None))
-    except Exception as e:
-        logger.error(f"Error fetching subscriptions: {e}")
-        sys.exit(1)
+        await page.goto(f"https://www.reddit.com/r/{sub_name}/")
+        await asyncio.sleep(2)
 
-    total = len(subscriptions)
-    for i, sub in enumerate(subscriptions):
-        logger.info(f"[{i+1}/{total}] Processing r/{sub.display_name}...")
-
-        # Subscription date is not available via API, we use creation date instead.
-        created_at = datetime.fromtimestamp(sub.created_utc).strftime('%Y-%m-%d')
-
-        # Fetch weekly metrics (best effort)
-        visitors, contributions = fetch_weekly_metrics(sub.display_name)
-
-        subreddits_data.append({
-            'name': sub.display_name,
-            'weekly_visitors': visitors,
-            'weekly_contributions': contributions,
-            'subscribers': sub.subscribers,
-            'created_date': created_at
-        })
-
-        # Slow down to avoid being blocked
-        time.sleep(1)
-
-    return subreddits_data
-
-def save_to_csv(data, filename, sort_by='weekly_contributions'):
-    """Saves the collected data to a CSV file, sorted by the specified metric."""
-    if not data:
-        logger.warning("No data to save.")
-        return
-
-    # Sort data descending by default
-    sorted_data = sorted(data, key=lambda x: int(x.get(sort_by, 0)), reverse=True)
-
-    keys = data[0].keys()
-    with open(filename, 'w', newline='', encoding='utf-8') as f:
-        dict_writer = csv.DictWriter(f, fieldnames=keys)
-        dict_writer.writeheader()
-        dict_writer.writerows(sorted_data)
-
-    logger.info(f"Data saved to {filename}")
-
-def load_from_csv(filename):
-    """Loads subreddit data from a CSV file."""
-    if not os.path.exists(filename):
-        logger.error(f"File {filename} not found.")
-        return []
-
-    with open(filename, 'r', encoding='utf-8') as f:
-        return list(csv.DictReader(f))
-
-def main():
-    parser = argparse.ArgumentParser(description="Manage Reddit subscriptions based on activity metrics.")
-    parser.add_argument("--fetch", action="store_true", help="Fetch fresh data from Reddit")
-    parser.add_argument("--csv", default="subreddits_stats.csv", help="CSV file path (default: subreddits_stats.csv)")
-    parser.add_argument("--sort", choices=["weekly_visitors", "weekly_contributions"], default="weekly_contributions", help="Sort metric")
-
-    args = parser.parse_args()
-
-    reddit = None
-    data = []
-
-    if args.fetch:
-        reddit = get_reddit_instance()
-        data = collect_subreddits(reddit)
-        save_to_csv(data, args.csv, sort_by=args.sort)
-    else:
-        if os.path.exists(args.csv):
-            logger.info(f"Loading data from {args.csv}")
-            data = load_from_csv(args.csv)
+        # Try different selectors for the "Joined" button
+        button = await page.query_selector("button:has-text('Joined'), [aria-label*='Leave'], button:has-text('Leave')")
+        if button:
+            await button.click()
+            await asyncio.sleep(1)
+            # Handle confirmation popup if it appears
+            confirm = await page.query_selector("button:has-text('Leave')")
+            if confirm:
+                await confirm.click()
+                await asyncio.sleep(1)
+            print(f"Success.")
         else:
-            logger.info("No CSV found. Use --fetch to get data from Reddit.")
-            return
+            print(f"Could not find leave button (might already be unsubscribed).")
+    except Exception as e:
+        print(f"Error during unsubscription: {e}")
 
-    if not data:
-        return
+async def run_manager():
+    async with async_playwright() as p:
+        while True:
+            print("\n--- Reddit Subreddit Manager (No API Key) ---")
+            print("1. Login (Headed Browser)")
+            print("2. Fetch & Analyze Subreddits (Scrape Mode)")
+            print("3. Filter & Unsubscribe (from CSV)")
+            print("4. Exit")
 
-    while True:
-        print(f"\nSubreddits loaded: {len(data)}")
-        print("1. Sort and show top 10")
-        print("2. Filter and Unsubscribe")
-        print("3. Exit")
+            choice = input("Select an option: ")
 
-        choice = input("Select an option: ")
+            if choice == '1':
+                await login(p)
 
-        if choice == '3':
-            break
-        elif choice == '1':
-            sort_metric = input("Sort by (1: weekly_visitors, 2: weekly_contributions): ")
-            metric_key = 'weekly_visitors' if sort_metric == '1' else 'weekly_contributions'
-            sorted_data = sorted(data, key=lambda x: int(x.get(metric_key, 0)), reverse=True)
-            for item in sorted_data[:10]:
-                print(f"r/{item['name']}: {metric_key}={item[metric_key]}, subscribers={item['subscribers']}")
-        elif choice == '2':
-            filter_metric = input("Filter by (1: weekly_visitors, 2: weekly_contributions): ")
-            metric_key = 'weekly_visitors' if filter_metric == '1' else 'weekly_contributions'
+            elif choice == '2':
+                if not os.path.exists(SESSION_FILE):
+                    print("Error: No session found. Please login first (Option 1).")
+                    continue
 
-            try:
-                cutoff = float(input(f"Enter cutoff value for {metric_key} (subreddits BELOW this will be removed): "))
-            except ValueError:
-                print("Invalid cutoff value.")
-                continue
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(storage_state=SESSION_FILE)
+                page = await context.new_page()
 
-            to_unsubscribe = [row['name'] for row in data if int(row[metric_key]) < cutoff]
+                subs = await get_subscribed_subreddits(page)
+                all_data = []
+                for i, name in enumerate(subs):
+                    print(f"[{i+1}/{len(subs)}] Analyzing r/{name}...")
+                    data = await scrape_subreddit_metrics(page, name)
+                    all_data.append(data)
+                    await asyncio.sleep(1) # Be gentle
 
-            if not to_unsubscribe:
-                print("No subreddits found below the cutoff.")
-                continue
+                df = pd.DataFrame(all_data)
+                # Default sort by contributions descending
+                df = df.sort_values(by='weekly_contributions', ascending=False)
+                df.to_csv(OUTPUT_CSV, index=False)
+                print(f"\nDone! Results saved to {OUTPUT_CSV}")
+                await browser.close()
 
-            print(f"\nFound {len(to_unsubscribe)} subreddits below the cutoff:")
-            print(", ".join(to_unsubscribe))
+            elif choice == '3':
+                if not os.path.exists(OUTPUT_CSV):
+                    print(f"Error: {OUTPUT_CSV} not found. Run Option 2 first.")
+                    continue
 
-            confirm = input(f"\nAre you sure you want to unsubscribe from these {len(to_unsubscribe)} subreddits? (yes/no): ")
-            if confirm.lower() == 'yes':
-                if not reddit:
-                    reddit = get_reddit_instance()
+                df = pd.read_csv(OUTPUT_CSV)
+                print(f"\nLoaded {len(df)} subreddits.")
 
-                for name in to_unsubscribe:
-                    try:
-                        logger.info(f"Unsubscribing from r/{name}...")
-                        reddit.subreddit(name).unsubscribe()
-                    except Exception as e:
-                        logger.error(f"Failed to unsubscribe from r/{name}: {e}")
-                print("Unsubscription complete.")
+                metric = input("Filter by (1: weekly_visitors, 2: weekly_contributions): ")
+                metric_key = 'weekly_visitors' if metric == '1' else 'weekly_contributions'
+
+                try:
+                    cutoff = float(input(f"Enter cutoff value for {metric_key} (BELOW this will be removed): "))
+                except ValueError:
+                    print("Invalid input.")
+                    continue
+
+                to_remove = df[df[metric_key] < cutoff]['name'].tolist()
+
+                if not to_remove:
+                    print("No subreddits found below cutoff.")
+                else:
+                    print(f"\nSubreddits to remove: {', '.join(to_remove)}")
+                    confirm = input(f"Are you sure you want to unsubscribe from {len(to_remove)} subreddits? (yes/no): ")
+                    if confirm.lower() == 'yes':
+                        browser = await p.chromium.launch(headless=False) # Headed to see progress/avoid being flagged
+                        context = await browser.new_context(storage_state=SESSION_FILE)
+                        page = await context.new_page()
+
+                        for name in to_remove:
+                            await unsubscribe(page, name)
+                            await asyncio.sleep(2)
+
+                        print("\nFinished cleanup.")
+                        await browser.close()
+
+            elif choice == '4':
                 break
-            else:
-                print("Operation cancelled.")
-        else:
-            print("Invalid choice.")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run_manager())
