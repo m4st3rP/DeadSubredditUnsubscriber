@@ -7,23 +7,17 @@ A tool to help you clean up your Reddit subscriptions based on actual community 
 ## Features
 
 - **Activity Metrics**: Scrapes "Weekly Visitors" and "Weekly Contributions" directly from subreddit pages.
+- **Manual Import**: If automated discovery fails, you can paste your "multireddit" link directly.
 - **Bulk Cleanup**: Define a cutoff value and automatically unsubscribe from subreddits that fall below it.
 - **CSV Export**: Saves all your subscription data to a CSV for easy sorting and review.
-- **Secure Session**: Saves your login session locally so you don't have to log in every time.
-
-## Prerequisites
-
-- Python 3.8+
-- [Playwright](https://playwright.dev/python/docs/intro)
 
 ## Installation
 
-1. Clone this repository or download the script.
-2. Install the required Python packages:
+1. Install the required Python packages:
    ```bash
    pip install playwright pandas
    ```
-3. Install the browser binaries:
+2. Install the browser binaries:
    ```bash
    playwright install chromium
    ```
@@ -35,23 +29,21 @@ Run the script:
 python subreddit_manager.py
 ```
 
-### Step 1: Login
-Choose **Option 1** from the menu. A browser window will open. Log in to your Reddit account normally. Once you are logged in, the script will save your session and close the browser.
+### Step 1: Login (Option 1)
+Choose **Option 1**. A browser window will open. Log in to your Reddit account. Once you are logged in, return to the terminal and press **ENTER**.
 
-### Step 2: Fetch & Analyze
-Choose **Option 2**. The script will:
-- Navigate to your "mine" subreddits page.
-- Scroll to capture all your subscriptions.
-- Visit each subreddit one by one to scrape its activity metrics.
-- Save everything to `subreddits_stats.csv`.
+### Step 2: Fetch & Analyze (Option 2 or 3)
+If automated discovery (Option 2) finds no subreddits, use **Option 3**:
+1. Go to [reddit.com/subreddits](https://www.reddit.com/subreddits).
+2. On the right sidebar, look for **"multireddit of your subscriptions"**.
+3. Right-click that link and select **"Copy link address"**.
+4. Paste that link into the script when prompted.
+5. The script will visit each subreddit to scrape activity metrics and save them to `subreddits_stats.csv`.
 
-### Step 3: Filter & Unsubscribe
-Choose **Option 3**.
-- The script will load the CSV.
-- You can choose which metric to filter by (Visitors or Contributions).
-- Enter a cutoff value.
-- Review the list of subreddits to be removed.
-- Confirm with `yes` to begin the automated unsubscription process.
+### Step 3: Filter & Unsubscribe (Option 4)
+Choose **Option 4**.
+- Choose a metric (Visitors or Contributions) and enter a cutoff value.
+- Confirm with `y` to begin the automated unsubscription process.
 
 ## CSV Columns
 
@@ -59,7 +51,4 @@ Choose **Option 3**.
 - `weekly_visitors`: Estimated unique visitors in the last 7 days.
 - `weekly_contributions`: Number of posts and comments in the last 7 days.
 - `subscribers`: Total member count.
-- `created_date`: The date the subreddit was created (proxy for subscription date).
-
-## Note on "Subscription Date"
-Reddit does not publicly expose the exact date you subscribed to a community. This tool uses the **Subreddit Creation Date** as a fallback to help you identify how old a community is.
+- `created_date`: The date the subreddit was created.
