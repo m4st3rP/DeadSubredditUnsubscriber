@@ -3,6 +3,7 @@ import pandas as pd
 import re
 import os
 import sys
+import json
 from playwright.async_api import async_playwright
 
 # File to store the browser session to avoid repeated logins
@@ -42,78 +43,82 @@ def parse_subs_from_input(user_input):
     return list(clean_subs)
 
 async def scrape_subreddit_metrics(page, sub_name):
-    """Navigates to a subreddit and extracts metrics using Playwright selectors."""
+    """Navigates to a subreddit and extracts metrics using robust shadow-piercing evaluation."""
     url = f"https://www.reddit.com/r/{sub_name}/"
-    metrics = {'name': sub_name, 'weekly_visitors': 0, 'weekly_contributions': 0, 'subscribers': 0, 'created_date': 'Unknown'}
+    metrics = {
+        'name': sub_name,
+        'weekly_visitors': 0,
+        'weekly_contributions': 0,
+        'subscribers': 0
+    }
 
     try:
-        # We need a longer timeout and better wait condition for Shreddit
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(4) # Extra time for all widgets to load
+        # Load the page and wait for it to be ready
+        await page.goto(url, wait_until="load", timeout=60000)
 
-        # 1. Weekly Visitors
-        try:
-            visitor_el = page.locator("div:has-text('Weekly visitors')").locator("faceplate-number, span, div").first
-            # Look for the element that actually contains a number near the text
-            # Often it's a sibling or a parent's child
-            text = await page.locator("div:has-text('Weekly visitors')").inner_text()
-            match = re.search(r'([\d.kKM,]+)\s+Weekly\s+visitors', text, re.IGNORECASE)
-            if not match:
-                # Try finding the number element directly
-                visitor_container = page.locator("div:has-text('Weekly visitors')")
-                # Shreddit often uses faceplate-number
-                num_el = visitor_container.locator("faceplate-number").first
-                val_text = await num_el.get_attribute("number") or await num_el.inner_text()
-                if val_text: metrics['weekly_visitors'] = parse_stat(val_text)
-            else:
-                metrics['weekly_visitors'] = parse_stat(match.group(1))
-        except: pass
+        # Scroll down to trigger lazy-loading of sidebar widgets
+        await page.evaluate("window.scrollTo(0, 1000)")
+        # Give Shreddit widgets ample time to "hydrate" their numbers
+        await asyncio.sleep(8)
 
-        # 2. Weekly Contributions
-        try:
-            contrib_text = await page.locator("div:has-text('Weekly contributions')").inner_text()
-            match = re.search(r'([\d.kKM,]+)\s+Weekly\s+contributions', contrib_text, re.IGNORECASE)
-            if not match:
-                num_el = page.locator("div:has-text('Weekly contributions')").locator("faceplate-number").first
-                val_text = await num_el.get_attribute("number") or await num_el.inner_text()
-                if val_text: metrics['weekly_contributions'] = parse_stat(val_text)
-            else:
-                metrics['weekly_contributions'] = parse_stat(match.group(1))
-        except: pass
+        # Use a very aggressive in-browser evaluation to find the numbers, piercing shadow DOM
+        found_metrics = await page.evaluate("""
+            () => {
+                const res = { v: 0, c: 0, s: 0 };
+                const parse = (s) => {
+                    if (!s) return 0;
+                    const c = s.toLowerCase().replace(/,/g, '').trim();
+                    if (c.includes('k')) return parseFloat(c.replace('k', '')) * 1000;
+                    if (c.includes('m')) return parseFloat(c.replace('m', '')) * 1000000;
+                    return parseFloat(c) || 0;
+                };
 
-        # 3. Subscribers & Created Date
-        try:
-            sub_text = await page.locator("div:has-text('Members')").inner_text() or await page.locator("div:has-text('subscribers')").inner_text()
-            match = re.search(r'([\d.kKM,]+)', sub_text)
-            if match: metrics['subscribers'] = parse_stat(match.group(1))
+                const findInNode = (root) => {
+                    // Check faceplate-number
+                    const faceplates = (root.querySelectorAll ? root.querySelectorAll('faceplate-number') : []);
+                    faceplates.forEach(el => {
+                        const label = (el.getAttribute('label') || el.parentElement.innerText || "").toLowerCase();
+                        const num = el.getAttribute('number') || el.innerText;
+                        if (label.includes('visitors')) res.v = Math.max(res.v, parse(num));
+                        else if (label.includes('contributions')) res.c = Math.max(res.c, parse(num));
+                        else if (label.includes('members') || label.includes('subscribers')) res.s = Math.max(res.s, parse(num));
+                    });
 
-            # Use raw content for date as it's usually just a string
-            content = await page.content()
-            date_match = re.search(r'Created\s+([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})', content)
-            if date_match: metrics['created_date'] = date_match.group(1)
-        except: pass
+                    // Check text patterns in this root
+                    const text = (root.innerText || root.textContent || "");
+                    if (res.v === 0) {
+                        const m = text.match(/([\\d.kKM,]+)\\s+Weekly\\s+visitors/i);
+                        if (m) res.v = parse(m[1]);
+                    }
+                    if (res.c === 0) {
+                        const m = text.match(/([\\d.kKM,]+)\\s+Weekly\\s+contributions/i);
+                        if (m) res.c = parse(m[1]);
+                    }
+                    if (res.s === 0) {
+                        const m = text.match(/([\\d.kKM,]+)\\s+(Members|subscribers)/i);
+                        if (m) res.s = parse(m[1]);
+                    }
 
-        # Fallback: if visitors/contributions are still 0, try a more aggressive regex on the whole page
-        if metrics['weekly_visitors'] == 0 or metrics['weekly_contributions'] == 0:
-            content = await page.content()
-            v_match = re.search(r'([\d.kKM,]+)\s+Weekly\s+visitors', content, re.IGNORECASE)
-            c_match = re.search(r'([\d.kKM,]+)\s+Weekly\s+contributions', content, re.IGNORECASE)
-            if v_match and metrics['weekly_visitors'] == 0: metrics['weekly_visitors'] = parse_stat(v_match.group(1))
-            if c_match and metrics['weekly_contributions'] == 0: metrics['weekly_contributions'] = parse_stat(c_match.group(1))
+                    // Recurse into shadow roots
+                    const all = (root.querySelectorAll ? root.querySelectorAll('*') : []);
+                    all.forEach(el => {
+                        if (el.shadowRoot) findInNode(el.shadowRoot);
+                    });
+                };
+
+                findInNode(document.body);
+                return res;
+            }
+        """)
+
+        metrics['weekly_visitors'] = int(found_metrics['v'])
+        metrics['weekly_contributions'] = int(found_metrics['c'])
+        metrics['subscribers'] = int(found_metrics['s'])
 
     except Exception as e:
         print(f"Error scraping r/{sub_name}: {e}")
 
     return metrics
-
-def parse_stat(val):
-    if not val: return 0
-    val = str(val).lower().replace(',', '').strip()
-    try:
-        if 'k' in val: return int(float(val.replace('k', '')) * 1000)
-        if 'm' in val: return int(float(val.replace('m', '')) * 1000000)
-        return int(float(val))
-    except: return 0
 
 async def unsubscribe(page, sub_name):
     print(f"Unsubscribing from r/{sub_name}...")
@@ -143,7 +148,7 @@ async def run_manager():
 
             if choice == '1':
                 await login(p)
-            elif choice == '2':
+            elif choice in ['2']:
                 if not os.path.exists(SESSION_FILE):
                     print("Error: session file missing. Please login first.")
                     continue
@@ -156,17 +161,32 @@ async def run_manager():
                     print("No subreddits identified.")
                     continue
 
+                is_headless = input("Run browser in headless mode? (y/n, recommend 'n' if metrics were 0 before): ").lower() != 'n'
+
                 print(f"Analyzing {len(subs)} subreddits...")
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(storage_state=SESSION_FILE)
+                browser = await p.chromium.launch(headless=is_headless)
+                context = await browser.new_context(
+                    storage_state=SESSION_FILE,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
                 page = await context.new_page()
 
                 results = []
                 for i, name in enumerate(subs):
                     print(f"[{i+1}/{len(subs)}] r/{name}...", end="\r")
-                    results.append(await scrape_subreddit_metrics(page, name))
-                    # Optional: small random jitter to avoid rate limiting
-                    await asyncio.sleep(0.5)
+                    data = await scrape_subreddit_metrics(page, name)
+                    results.append(data)
+
+                    if name == "absolutelynotmeirl":
+                        v = data['weekly_visitors']
+                        c = data['weekly_contributions']
+                        print(f"\n[TEST] r/absolutelynotmeirl: {v} visitors (target: 763), {c} contributions (target: 20)")
+                        if not (763 - 50 <= v <= 763 + 50):
+                            print(f"  FAILED: Visitors ({v}) outside range 763 +- 50.")
+                        else:
+                            print(f"  SUCCESS: Visitors ({v}) within range!")
+
+                    await asyncio.sleep(1)
 
                 if results:
                     pd.DataFrame(results).sort_values('weekly_contributions', ascending=False).to_csv(OUTPUT_CSV, index=False)
