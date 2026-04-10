@@ -22,16 +22,10 @@ async def login(p):
 
     await page.goto("https://www.reddit.com/login")
 
-    # We wait for manual user input in the terminal as a fallback to unreliable selectors
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, input, "Press ENTER here when you have finished logging in...")
 
     try:
-        # Check if we are actually logged in by looking for common elements
-        content = await page.content()
-        if "login" in page.url.lower():
-             print("Warning: It looks like you might still be on the login page.")
-
         # Save the storage state
         await context.storage_state(path=SESSION_FILE)
         print(f"Session saved to {SESSION_FILE}")
@@ -41,60 +35,73 @@ async def login(p):
         await browser.close()
 
 async def get_subscribed_subreddits(page):
-    """Extracts the list of subreddits by scrolling through the 'mine' page."""
+    """Extracts the list of subreddits by exploring multiple Reddit pages."""
     print("Fetching subscribed subreddits...")
-    # Navigate to the classic subreddits page which is more stable for scraping
-    await page.goto("https://old.reddit.com/subreddits/mine/")
-
     subreddits = set()
 
-    while True:
-        # Extract currently visible subreddits (old reddit style)
-        elements = await page.query_selector_all("a.title")
-        for el in elements:
-            href = await el.get_attribute("href")
-            if href and "/r/" in href:
-                parts = href.split("/r/")
-                if len(parts) > 1:
-                    name = parts[1].split("/")[0].strip()
-                    if name and name.lower() not in ["all", "popular", "friends"]:
-                        subreddits.add(name.lower())
+    # Target URLs that list subreddits
+    urls = [
+        "https://old.reddit.com/subreddits/mine/",
+        "https://www.reddit.com/subreddits/mine/",
+        "https://www.reddit.com/best/communities/1/", # Another source of community lists
+    ]
 
-        # Check for "next" button in old reddit
-        next_button = await page.query_selector(".next-button a")
-        if next_button:
-            await next_button.click()
-            await asyncio.sleep(2)
-        else:
-            break
+    for url in urls:
+        print(f"Scanning {url}...")
+        try:
+            await page.goto(url, wait_until="domcontentloaded")
+            await asyncio.sleep(3)
 
-    # Fallback to new reddit if old reddit didn't work or for completeness
-    if not subreddits:
-        print("Old Reddit list empty, trying new Reddit...")
-        await page.goto("https://www.reddit.com/subreddits/mine/")
-        last_height = await page.evaluate("document.body.scrollHeight")
-        while True:
-            elements = await page.query_selector_all("a[href*='/r/']")
+            # Extract links containing /r/
+            # This is a broad search to ensure we catch everything
+            elements = await page.query_selector_all("a")
             for el in elements:
                 href = await el.get_attribute("href")
                 if href and "/r/" in href:
-                    parts = href.split("/r/")
-                    name = parts[1].split("/")[0].strip()
-                    if name and name.lower() not in ["all", "popular"]:
-                        subreddits.add(name.lower())
+                    # Clean the name
+                    match = re.search(r'/r/([a-zA-Z0-9_]+)', href)
+                    if match:
+                        name = match.group(1).lower()
+                        if name not in ["all", "popular", "friends", "dashboard", "help", "redditdev", "mod", "home"]:
+                            subreddits.add(name)
 
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            # Handle pagination if on old reddit
+            if "old.reddit" in url:
+                for _ in range(10): # Max 10 pages for safety
+                    next_button = await page.query_selector(".next-button a")
+                    if next_button:
+                        await next_button.click()
+                        await asyncio.sleep(2)
+                        elements = await page.query_selector_all("a.title")
+                        for el in elements:
+                            href = await el.get_attribute("href")
+                            match = re.search(r'/r/([a-zA-Z0-9_]+)', href)
+                            if match: subreddits.add(match.group(1).lower())
+                    else:
+                        break
+        except Exception as e:
+            print(f"Skipping {url} due to error: {e}")
+
+    # Fallback to the sidebar navigation in new reddit if still empty
+    if not subreddits:
+        print("Still nothing... checking sidebar navigation.")
+        await page.goto("https://www.reddit.com/", wait_until="networkidle")
+        # Try to open the community drawer
+        drawer_button = await page.query_selector("#left-nav-drawer-button, [aria-label='Communities']")
+        if drawer_button:
+            await drawer_button.click()
             await asyncio.sleep(2)
-            new_height = await page.evaluate("document.body.scrollHeight")
-            if new_height == last_height: break
-            last_height = new_height
+            elements = await page.query_selector_all("a[href*='/r/']")
+            for el in elements:
+                href = await el.get_attribute("href")
+                match = re.search(r'/r/([a-zA-Z0-9_]+)', href)
+                if match: subreddits.add(match.group(1).lower())
 
     print(f"Found {len(subreddits)} unique subreddits.")
     return list(subreddits)
 
 async def scrape_subreddit_metrics(page, sub_name):
     """Navigates to a subreddit and extracts metrics."""
-    # We use sh.reddit.com or www.reddit.com as old.reddit doesn't have the new weekly metrics
     url = f"https://www.reddit.com/r/{sub_name}/"
     metrics = {
         'name': sub_name,
@@ -106,12 +113,11 @@ async def scrape_subreddit_metrics(page, sub_name):
 
     try:
         await page.goto(url, wait_until="domcontentloaded")
-        await asyncio.sleep(3) # Shreddit needs time to load sidebars
+        await asyncio.sleep(2)
 
         content = await page.content()
 
-        # Look for numbers associated with "Weekly visitors" and "Weekly contributions"
-        # Using a more robust regex that ignores extra HTML tags in between
+        # Robust regex for activity metrics
         v_match = re.search(r'([\d.kKM,]+)\s+Weekly\s+visitors', content, re.IGNORECASE)
         c_match = re.search(r'([\d.kKM,]+)\s+Weekly\s+contributions', content, re.IGNORECASE)
 
@@ -144,21 +150,17 @@ async def unsubscribe(page, sub_name):
     print(f"Unsubscribing from r/{sub_name}...")
     try:
         await page.goto(f"https://www.reddit.com/r/{sub_name}/")
-        await asyncio.sleep(3)
-
-        # Try finding the 'Joined' button with various methods
-        for selector in ["button:has-text('Joined')", "[aria-label*='Leave']", "button:has-text('Leave')"]:
-            button = await page.query_selector(selector)
-            if button:
-                await button.click()
-                await asyncio.sleep(1)
-                # Confirm if a modal appears
-                confirm = await page.query_selector("button:has-text('Leave')")
-                if confirm:
-                    await confirm.click()
-                print(f"Unsubscribed from r/{sub_name}")
-                return
-        print(f"Could not find leave button for r/{sub_name}")
+        await asyncio.sleep(2)
+        # Try finding the Joined button
+        button = await page.query_selector("button:has-text('Joined'), [aria-label*='Leave'], button:has-text('Leave')")
+        if button:
+            await button.click()
+            await asyncio.sleep(1)
+            confirm = await page.query_selector("button:has-text('Leave')")
+            if confirm: await confirm.click()
+            print("Success.")
+        else:
+            print("Button not found.")
     except Exception as e:
         print(f"Error: {e}")
 
@@ -166,8 +168,8 @@ async def run_manager():
     async with async_playwright() as p:
         while True:
             print("\n--- Reddit Subreddit Manager ---")
-            print("1. Login (Headed Browser)")
-            print("2. Fetch & Analyze (Scrape Mode)")
+            print("1. Login (Headed)")
+            print("2. Fetch & Analyze")
             print("3. Filter & Unsubscribe (from CSV)")
             print("4. Exit")
 
@@ -177,12 +179,25 @@ async def run_manager():
                 await login(p)
             elif choice == '2':
                 if not os.path.exists(SESSION_FILE):
-                    print("Please login first.")
+                    print("Error: session file missing. Please login first.")
                     continue
+
                 browser = await p.chromium.launch(headless=True)
                 context = await browser.new_context(storage_state=SESSION_FILE)
                 page = await context.new_page()
+
+                # Check if we are really logged in
+                await page.goto("https://www.reddit.com/settings/")
+                if "login" in page.url.lower():
+                    print("Error: The saved session is invalid or expired. Please login again.")
+                    await browser.close()
+                    continue
+
                 subs = await get_subscribed_subreddits(page)
+                if not subs:
+                    print("Error: No subreddits found. Ensure you are logged in and have subscriptions.")
+                    await browser.close()
+                    continue
 
                 results = []
                 for i, name in enumerate(subs):
@@ -191,24 +206,29 @@ async def run_manager():
                     results.append(data)
                     await asyncio.sleep(1)
 
-                pd.DataFrame(results).sort_values('weekly_contributions', ascending=False).to_csv(OUTPUT_CSV, index=False)
-                print(f"Done. Saved to {OUTPUT_CSV}")
+                if results:
+                    df = pd.DataFrame(results)
+                    df.sort_values('weekly_contributions', ascending=False).to_csv(OUTPUT_CSV, index=False)
+                    print(f"\nSaved to {OUTPUT_CSV}")
+                else:
+                    print("No data collected.")
+
                 await browser.close()
+
             elif choice == '3':
                 if not os.path.exists(OUTPUT_CSV):
-                    print("No CSV found.")
+                    print("Error: CSV not found.")
                     continue
                 df = pd.read_csv(OUTPUT_CSV)
                 m = input("Filter by (1: visitors, 2: contributions): ")
                 k = 'weekly_visitors' if m == '1' else 'weekly_contributions'
-                val = float(input(f"Cutoff for {k}: "))
+                val = float(input(f"Cutoff: "))
                 to_rem = df[df[k] < val]['name'].tolist()
-                if to_rem and input(f"Remove {len(to_rem)} subs? (y/n): ") == 'y':
+                if to_rem and input(f"Unsubscribe from {len(to_rem)}? (y/n): ") == 'y':
                     browser = await p.chromium.launch(headless=False)
                     context = await browser.new_context(storage_state=SESSION_FILE)
                     page = await context.new_page()
-                    for name in to_rem:
-                        await unsubscribe(page, name)
+                    for name in to_rem: await unsubscribe(page, name)
                     await browser.close()
             elif choice == '4':
                 break
